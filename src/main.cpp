@@ -1,476 +1,236 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <SPI.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <FastLED.h>
+#include "config.h"
+#include "oled_display.h"
+#include "led_control.h"
+#include "gsr_sensor.h"
+#include "motion_sensor.h"
+// #include "heart_sensor.h"  // ← 注释掉
 
-// ========== OLED配置 ==========
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_MOSI 11
-#define OLED_CLK 12
-#define OLED_DC 13
-#define OLED_CS 14
-#define OLED_RESET 10
+// 创建传感器对象
+OLEDDisplay oled;
+LEDControl led;
+GSRSensor gsr;
+MotionSensor motion(MOTION_SENSOR_ADDR);
+// HeartSensor heart(HEART_SENSOR_ADDR);  // ← 注释掉
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT,
-                         OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
-
-// ========== LED配置 ==========
-#define LED_PIN 2
-#define NUM_LEDS 30 // 改成你的实际数量
-
-CRGB leds[NUM_LEDS];
-
-// ========== RC522配置 (I2C) ==========
-#define I2C_SDA 8
-#define I2C_SCL 9
-#define RFID_RST 15
-#define RFID_ADDR 0x28
-
-// RC522寄存器
-#define CommandReg 0x01
-#define ComIEnReg 0x02
-#define ComIrqReg 0x04
-#define ErrorReg 0x06
-#define FIFODataReg 0x09
-#define FIFOLevelReg 0x0A
-#define BitFramingReg 0x0D
-#define CollReg 0x0E
-#define ModeReg 0x11
-#define TxControlReg 0x14
-#define TxASKReg 0x15
-#define TModeReg 0x2A
-#define TPrescalerReg 0x2B
-#define TReloadRegH 0x2C
-#define TReloadRegL 0x2D
-#define VersionReg 0x37
-
-#define PCD_Idle 0x00
-#define PCD_Transceive 0x0C
-#define PICC_REQIDL 0x26
-#define PICC_ANTICOLL 0x93
-
-// ========== RC522函数 ==========
-void writeReg(byte reg, byte value)
+// 学习内容类型
+enum ContentType
 {
-  Wire.beginTransmission(RFID_ADDR);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
-}
-
-byte readReg(byte reg)
-{
-  Wire.beginTransmission(RFID_ADDR);
-  Wire.write(reg);
-  Wire.endTransmission();
-  Wire.requestFrom(RFID_ADDR, 1);
-  return Wire.available() ? Wire.read() : 0;
-}
-
-void setBitMask(byte reg, byte mask)
-{
-  writeReg(reg, readReg(reg) | mask);
-}
-
-void clearBitMask(byte reg, byte mask)
-{
-  writeReg(reg, readReg(reg) & (~mask));
-}
-
-byte communicate(byte command, byte *sendData, byte sendLen, byte *backData, byte *backLen)
-{
-  byte irqEn = 0x00;
-  byte waitIRq = 0x00;
-
-  if (command == PCD_Transceive)
-  {
-    irqEn = 0x77;
-    waitIRq = 0x30;
-  }
-
-  writeReg(ComIEnReg, irqEn | 0x80);
-  clearBitMask(ComIrqReg, 0x80);
-  setBitMask(FIFOLevelReg, 0x80);
-  writeReg(CommandReg, PCD_Idle);
-
-  for (byte i = 0; i < sendLen; i++)
-  {
-    writeReg(FIFODataReg, sendData[i]);
-  }
-
-  writeReg(CommandReg, command);
-  if (command == PCD_Transceive)
-  {
-    setBitMask(BitFramingReg, 0x80);
-  }
-
-  int timeout = 2000;
-  byte n;
-  do
-  {
-    n = readReg(ComIrqReg);
-    timeout--;
-  } while ((timeout != 0) && !(n & 0x01) && !(n & waitIRq));
-
-  clearBitMask(BitFramingReg, 0x80);
-
-  if (timeout == 0)
-    return 2;
-
-  byte errorReg = readReg(ErrorReg);
-  if (errorReg & 0x1B)
-    return 1;
-  if (n & irqEn & 0x01)
-    return 2;
-
-  if (command == PCD_Transceive)
-  {
-    n = readReg(FIFOLevelReg);
-    byte lastBits = readReg(CollReg) & 0x07;
-    *backLen = lastBits ? (n - 1) * 8 + lastBits : n * 8;
-
-    if (n > 0)
-    {
-      for (byte i = 0; i < n; i++)
-      {
-        backData[i] = readReg(FIFODataReg);
-      }
-    }
-  }
-  return 0;
-}
-
-byte requestCard(byte *cardType)
-{
-  byte status, backBits;
-  byte buffer[2];
-
-  writeReg(BitFramingReg, 0x07);
-  buffer[0] = PICC_REQIDL;
-
-  status = communicate(PCD_Transceive, buffer, 1, buffer, &backBits);
-
-  if (status == 0 && backBits == 0x10)
-  {
-    *cardType = buffer[0];
-    *(cardType + 1) = buffer[1];
-    return 0;
-  }
-  return 1;
-}
-
-byte anticoll(byte *uid)
-{
-  byte status, backBits;
-  byte buffer[9];
-
-  writeReg(BitFramingReg, 0x00);
-  buffer[0] = PICC_ANTICOLL;
-  buffer[1] = 0x20;
-
-  status = communicate(PCD_Transceive, buffer, 2, buffer, &backBits);
-
-  if (status == 0)
-  {
-    for (byte i = 0; i < 4; i++)
-    {
-      uid[i] = buffer[i];
-    }
-  }
-  return status;
-}
-
-// ========== LED效果函数 ==========
-void ledFlash(CRGB color, int times)
-{
-  for (int i = 0; i < times; i++)
-  {
-    fill_solid(leds, NUM_LEDS, color);
-    FastLED.show();
-    delay(150);
-    fill_solid(leds, NUM_LEDS, CRGB::Black);
-    FastLED.show();
-    delay(150);
-  }
-}
-
-void ledSolid(CRGB color)
-{
-  fill_solid(leds, NUM_LEDS, color);
-  FastLED.show();
-}
-
-void ledOff()
-{
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  FastLED.show();
-}
-
-// ========== 卡片映射 ==========
-struct CardInfo
-{
-  String uid;
-  String type;
-  String topic;
-  String lang;
+  VOCABULARY,
+  GRAMMAR,
+  CONVERSATION
 };
 
-CardInfo cards[10];
-int cardCount = 0;
+ContentType currentContent = VOCABULARY;
+unsigned long lastContentChange = 0;
+const unsigned long CONTENT_INTERVAL = 10000;
 
-void addCard(String uid, String type, String topic, String lang)
-{
-  if (cardCount < 10)
-  {
-    cards[cardCount].uid = uid;
-    cards[cardCount].type = type;
-    cards[cardCount].topic = topic;
-    cards[cardCount].lang = lang;
-    cardCount++;
-  }
-}
+// 传感器状态
+bool gsrReady = false;
+bool motionReady = false;
+// bool heartReady = false;  // ← 注释掉
 
-CardInfo *findCard(String uid)
-{
-  for (int i = 0; i < cardCount; i++)
-  {
-    if (cards[i].uid == uid)
-    {
-      return &cards[i];
-    }
-  }
-  return nullptr;
-}
-
-// ========== 主程序 ==========
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(SERIAL_BAUD);
   delay(2000);
 
   Serial.println("\n========================================");
-  Serial.println("  Language Learning Device v1.0");
+  Serial.println("  Language Learning Device v2.0");
+  Serial.println("  认知负载检测系统");
   Serial.println("========================================\n");
+
+  // 初始化I2C总线
+  Serial.print("初始化I2C总线... ");
+  pinMode(I2C_SDA, INPUT_PULLUP);
+  pinMode(I2C_SCL, INPUT_PULLUP);
+  delay(100);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(I2C_SPEED);
+  Serial.println("✅");
 
   // 初始化LED
   Serial.print("初始化LED... ");
-  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.setBrightness(50);
-  ledFlash(CRGB::Blue, 2); // 启动指示
+  led.begin();
+  led.flash(CRGB::Blue, 2);
   Serial.println("✅");
 
   // 初始化OLED
   Serial.print("初始化OLED... ");
-  if (!display.begin(SSD1306_SWITCHCAPVCC))
+  if (!oled.begin())
   {
     Serial.println("❌");
-    ledFlash(CRGB::Red, 5);
+    led.flash(CRGB::Red, 5);
     while (1)
       ;
   }
   Serial.println("✅");
+  oled.showStartup();
+  delay(1000);
 
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Initializing...");
-  display.display();
-
-  // 初始化I2C (RC522)
-  Serial.print("初始化I2C... ");
-  pinMode(I2C_SDA, INPUT_PULLUP);
-  pinMode(I2C_SCL, INPUT_PULLUP);
-  delay(100);
-
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(50000);
+  // 初始化GSR
+  Serial.print("初始化GSR... ");
+  gsr.begin();
   Serial.println("✅");
 
-  // 初始化RC522
-  Serial.print("初始化RC522... ");
-  pinMode(RFID_RST, OUTPUT);
-  digitalWrite(RFID_RST, LOW);
-  delay(100);
-  digitalWrite(RFID_RST, HIGH);
-  delay(300);
-
-  byte version = readReg(VersionReg);
-  if (version == 0x00 || version == 0xFF)
+  // 初始化运动传感器
+  Serial.print("初始化运动传感器... ");
+  if (!motion.begin())
   {
-    Serial.println("❌");
-    ledFlash(CRGB::Red, 5);
-    while (1)
-      ;
+    Serial.println("❌ (继续运行)");
   }
-  Serial.printf("✅ (v0x%02X)\n", version);
+  else
+  {
+    Serial.println("✅");
+    motionReady = true;
+  }
 
-  // 配置RC522
-  writeReg(CommandReg, 0x0F);
-  delay(50);
-  writeReg(TModeReg, 0x80);
-  writeReg(TPrescalerReg, 0xA9);
-  writeReg(TReloadRegH, 0x03);
-  writeReg(TReloadRegL, 0xE8);
-  writeReg(TxASKReg, 0x40);
-  writeReg(ModeReg, 0x3D);
-  setBitMask(TxControlReg, 0x03);
-
-  // 添加卡片映射
-  addCard("12:37:64:06", "vocabulary", "daily_routine", "en"); // 蓝色钥匙扣
-  addCard("21:47:1f:5d", "grammar", "past_tense", "en");       // 白色卡片
-  addCard("88:5a:75:66", "conversation", "restaurant", "es");  // RFID贴纸
+  // ← 注释掉心率传感器初始化
 
   Serial.println("\n✅ 系统就绪！\n");
 
-  // 就绪指示
-  ledFlash(CRGB::Green, 2);
-  ledOff();
+  led.flash(CRGB::Green, 2);
+  led.off();
 
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(0, 0);
-  display.println("Ready!");
-  display.setTextSize(1);
-  display.setCursor(0, 25);
-  display.println("Scan a card to");
-  display.println("start learning");
-  display.display();
+  // 校准传感器
+  Serial.println("========================================");
+  Serial.println("  传感器校准");
+  Serial.println("========================================\n");
+
+  Serial.println("GSR校准:");
+  Serial.println("  请将电极夹在手指上");
+  Serial.println("  保持放松状态");
+  delay(3000);
+  gsr.calibrate(10);
+  gsrReady = true;
+
+  if (motionReady)
+  {
+    Serial.println("\n运动传感器校准:");
+    Serial.println("  请保持设备静止");
+    delay(2000);
+    motion.calibrateFidgeting(10);
+  }
+
+  Serial.println("\n========================================");
+  Serial.println("  开始学习模式");
+  Serial.println("========================================\n");
+
+  oled.showReady();
+  delay(2000);
 }
 
 void loop()
 {
-  byte cardType[2];
-  byte uid[4];
+  unsigned long currentTime = millis();
 
-  if (requestCard(cardType) == 0)
+  // 自动切换内容
+  if (currentTime - lastContentChange > CONTENT_INTERVAL)
   {
-    // 检测到卡片 - 白色闪烁
-    ledFlash(CRGB::White, 1);
+    lastContentChange = currentTime;
 
-    if (anticoll(uid) == 0)
+    currentContent = (ContentType)((currentContent + 1) % 3);
+
+    Serial.println("\n========================================");
+    Serial.print("切换内容: ");
+
+    switch (currentContent)
     {
-      String uidStr = "";
-      for (byte i = 0; i < 4; i++)
-      {
-        if (uid[i] < 0x10)
-          uidStr += "0";
-        uidStr += String(uid[i], HEX);
-        if (i < 3)
-          uidStr += ":";
-      }
+    case VOCABULARY:
+      Serial.println("Vocabulary");
+      oled.showVocabulary("STUDY", "v. 学习", "I study English");
+      break;
 
-      Serial.println("========================================");
-      Serial.print("检测到卡片: ");
-      Serial.println(uidStr);
+    case GRAMMAR:
+      Serial.println("Grammar");
+      oled.showGrammar("Present Tense",
+                       "She ___ to school\nevery day.",
+                       "go", "goes");
+      break;
 
-      CardInfo *card = findCard(uidStr);
-
-      if (card != nullptr)
-      {
-        // 识别成功 - 绿色
-        ledSolid(CRGB::Green);
-
-        Serial.print("类型: ");
-        Serial.println(card->type);
-        Serial.print("主题: ");
-        Serial.println(card->topic);
-        Serial.print("语言: ");
-        Serial.println(card->lang);
-        Serial.println("========================================\n");
-
-        delay(500);
-
-        // 学习模式 - 蓝色
-        ledSolid(CRGB::Blue);
-
-        // 显示学习内容
-        if (card->type == "vocabulary")
-        {
-          display.clearDisplay();
-          display.setTextSize(1);
-          display.setCursor(0, 0);
-          display.println("Vocabulary");
-          display.println("- Daily Routine -");
-          display.println("");
-          display.setTextSize(2);
-          display.println("WAKE UP");
-          display.setTextSize(1);
-          display.println("");
-          display.println("v. 醒来");
-          display.println("I wake up at 7am");
-          display.display();
-        }
-        else if (card->type == "grammar")
-        {
-          display.clearDisplay();
-          display.setTextSize(1);
-          display.setCursor(0, 0);
-          display.println("Grammar");
-          display.println("- Past Tense -");
-          display.println("");
-          display.println("Fill the blank:");
-          display.println("");
-          display.println("I ___ to school");
-          display.println("yesterday.");
-          display.println("");
-          display.println("A) go  B) went");
-          display.display();
-        }
-        else if (card->type == "conversation")
-        {
-          display.clearDisplay();
-          display.setTextSize(1);
-          display.setCursor(0, 0);
-          display.println("Conversacion");
-          display.println("- Restaurante -");
-          display.println("");
-          display.println("Camarero:");
-          display.println("Que desea?");
-          display.println("");
-          display.println("Tu:");
-          display.println("Quiero un cafe");
-          display.println("por favor");
-          display.display();
-        }
-
-        delay(5000);
-      }
-      else
-      {
-        // 未知卡片 - 红色闪烁
-        ledFlash(CRGB::Red, 3);
-
-        Serial.println("⚠️  未知卡片");
-        Serial.println("========================================\n");
-
-        display.clearDisplay();
-        display.setCursor(0, 0);
-        display.println("Unknown Card");
-        display.println("");
-        display.println("UID:");
-        display.println(uidStr);
-        display.println("");
-        display.println("Please register");
-        display.display();
-
-        delay(3000);
-      }
-
-      // 恢复待机
-      ledOff();
-      display.clearDisplay();
-      display.setTextSize(2);
-      display.setCursor(0, 0);
-      display.println("Ready!");
-      display.setTextSize(1);
-      display.setCursor(0, 25);
-      display.println("Scan next card");
-      display.display();
+    case CONVERSATION:
+      Serial.println("Conversation");
+      oled.showConversation("Greeting",
+                            "A: Hello!",
+                            "B: Hi! How are you?",
+                            "A: I'm fine, thanks.",
+                            "B: Nice to meet you!");
+      break;
     }
+
+    led.flash(CRGB::White, 1);
+  }
+
+  // 读取传感器
+  float gsrLoad = 0.0;
+  float motionLoad = 0.0;
+
+  if (gsrReady)
+  {
+    gsrLoad = gsr.getCognitiveLoad();
+  }
+
+  if (motionReady)
+  {
+    motionLoad = motion.getFidgetingLevel();
+  }
+
+  // 融合认知负载（只用GSR和运动）
+  float totalLoad = 0.0;
+
+  if (gsrReady)
+  {
+    totalLoad += gsrLoad * 0.7; // GSR权重70%
+  }
+
+  if (motionReady)
+  {
+    totalLoad += motionLoad * 0.3; // 运动权重30%
+  }
+
+  // LED反馈
+  led.setCognitiveLoad(totalLoad);
+
+  // 串口输出
+  static unsigned long lastPrint = 0;
+  if (currentTime - lastPrint > 2000)
+  {
+    lastPrint = currentTime;
+
+    Serial.println("----------------------------------------");
+    Serial.println("传感器数据:");
+
+    if (gsrReady)
+    {
+      Serial.printf("  GSR:    %.2f V (负载: %.2f)\n",
+                    gsr.getVoltage(), gsrLoad);
+    }
+
+    if (motionReady)
+    {
+      int16_t ax, ay, az;
+      motion.getAccel(ax, ay, az);
+      Serial.printf("  运动:   加速度(%d,%d,%d) (负载: %.2f)\n",
+                    ax, ay, az, motionLoad);
+    }
+
+    Serial.printf("\n总体认知负载: %.2f ", totalLoad);
+
+    if (totalLoad < LOAD_LOW_THRESHOLD)
+    {
+      Serial.println("(舒适) 🟢");
+    }
+    else if (totalLoad < LOAD_HIGH_THRESHOLD)
+    {
+      Serial.println("(适中) 🟡");
+    }
+    else
+    {
+      Serial.println("(压力) 🔴");
+    }
+
+    Serial.println("----------------------------------------\n");
   }
 
   delay(100);
